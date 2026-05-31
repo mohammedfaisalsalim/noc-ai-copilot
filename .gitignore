@@ -1,0 +1,9 @@
+venv/
+.venv/
+*.db
+*.db-wal
+*.db-shm
+chroma_db/
+.streamlit/
+__pycache__/
+*.pyc
