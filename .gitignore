@@ -1,9 +1,34 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Virtual environments ---
 venv/
 .venv/
+env/
+.env
+
+# --- App data (regenerated on first run) ---
+chroma_db/
 *.db
 *.db-wal
 *.db-shm
-chroma_db/
-.streamlit/
-__pycache__/
-*.pyc
+
+# --- Streamlit ---
+# Track theme config but never ship secrets
+.streamlit/secrets.toml
+
+# --- One-off installers, not needed in repo ---
+get-pip.py
+
+# --- IDE / OS clutter ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Scratch / temp files ---
+_*.py
+*.tmp
