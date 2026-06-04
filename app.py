@@ -17,8 +17,16 @@ CHROMA_DIR = "./chroma_db"
 COLLECTION_NAME = "noc_sops_v2"
 
 OLLAMA_URL = "http://localhost:11434"
+# Models below are aligned with the llm-gateway-platform fleet so both
+# projects share a single source of truth on what's installed.
+#   - llama3.1:8b   → gateway Tier 2 (heavy local) + chatbot direct-Ollama default
+#   - gemini-2.5-flash → gateway Tier 1 (balanced cloud) + chatbot direct-Gemini default
 DEFAULT_OLLAMA_MODEL = "llama3.1:8b"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-pro"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+# LLM Gateway (companion project: llm-gateway-platform)
+DEFAULT_GATEWAY_URL = "http://localhost:8000"
+DEFAULT_TEAM_ID = "noc-team"
 
 st.set_page_config(
     page_title="NOC.AI",
@@ -346,6 +354,24 @@ label, .stRadio label, .stCheckbox label {
     font-size: 0.95rem;
 }
 
+/* ===== Routing telemetry footer (shown under gateway answers) ===== */
+.route-footer {
+    margin-top: 0.6rem;
+    padding: 0.45rem 0.8rem;
+    background: rgba(0,212,255,0.05);
+    border: 1px solid rgba(0,212,255,0.2);
+    border-radius: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    color: #9AA5B1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.1rem;
+}
+.route-footer .key { color: #00D4FF; }
+.route-footer .val { color: #E8EAED; }
+
 /* ===== Misc ===== */
 hr { border-color: #1F2A38; margin: 1.5rem 0; }
 .stAlert { border-radius: 10px; }
@@ -442,6 +468,67 @@ def gemini_stream(prompt: str, model_name: str):
 
 
 # ==============================================================================
+# LLM GATEWAY BACKEND
+# Talks to the companion `llm-gateway-platform` (FastAPI service on :8000).
+# The gateway internally classifies prompts (tier 0/1/2), routes to
+# Llama 3.2 / Gemini Flash / Mistral, applies rate limits + budget guardrails,
+# and returns a single non-streamed response with rich routing telemetry.
+# ==============================================================================
+@st.cache_data(ttl=15)
+def gateway_status(url: str):
+    """Pings gateway root. Returns {available: bool}."""
+    try:
+        r = requests.get(f"{url}/", timeout=1.5)
+        if r.status_code == 200 and r.json().get("status") == "online":
+            return {"available": True}
+    except Exception:
+        pass
+    return {"available": False}
+
+
+class GatewayError(RuntimeError):
+    """Raised on 429 / 402 / 503 from the gateway with a user-friendly message."""
+
+
+def gateway_call(prompt: str, url: str, team_id: str) -> dict:
+    """POST to /v1/chat/completions and return the full StandardResponse payload.
+    Raises GatewayError with a friendly message on 429/402/503."""
+    try:
+        r = requests.post(
+            f"{url}/v1/chat/completions",
+            headers={"X-Team-Id": team_id, "Content-Type": "application/json"},
+            json={"messages": [{"role": "user", "content": prompt}]},
+            timeout=300,
+        )
+    except requests.exceptions.ConnectionError:
+        raise GatewayError(
+            f"Cannot reach the gateway at {url}. "
+            "Is `docker-compose up` running in the llm-gateway-platform project?"
+        )
+    except requests.exceptions.Timeout:
+        raise GatewayError("Gateway timed out after 5 minutes. The upstream model may be stuck.")
+
+    if r.status_code == 429:
+        retry = r.headers.get("Retry-After", "?")
+        raise GatewayError(
+            f"Rate limit reached for team `{team_id}` (60 requests/min). "
+            f"Retry after {retry}s."
+        )
+    if r.status_code == 402:
+        raise GatewayError(
+            f"Daily budget exceeded for team `{team_id}` ($5.00 cap). "
+            "Resets at midnight UTC."
+        )
+    if r.status_code == 503:
+        raise GatewayError(
+            "All upstream LLM providers are down (circuit breakers open). "
+            "Wait ~15s for the health-check loop to retry, then try again."
+        )
+    r.raise_for_status()
+    return r.json()
+
+
+# ==============================================================================
 # SESSION STATE
 # ==============================================================================
 if "chat_history" not in st.session_state:
@@ -456,11 +543,16 @@ if "pending_prompt" not in st.session_state:
     st.session_state.pending_prompt = None
 if "backend" not in st.session_state:
     st.session_state.backend = None
+if "gateway_url" not in st.session_state:
+    st.session_state.gateway_url = DEFAULT_GATEWAY_URL
+if "team_id" not in st.session_state:
+    st.session_state.team_id = DEFAULT_TEAM_ID
 
 # ==============================================================================
 # SIDEBAR — backend selection
 # ==============================================================================
 ollama_info = ollama_status()
+gateway_info = gateway_status(st.session_state.gateway_url)
 
 with st.sidebar:
     st.markdown(
@@ -481,10 +573,15 @@ with st.sidebar:
 
     st.markdown("<div class='section-label'>Backend</div>", unsafe_allow_html=True)
 
-    backend_options = ["Local (Ollama)", "Cloud (Gemini)"]
-    default_backend_idx = 0 if ollama_info["available"] else 1
+    backend_options = ["LLM Gateway", "Local (Ollama)", "Cloud (Gemini)"]
+    # Default: Gateway if online, else Ollama if online, else Gemini
     if st.session_state.backend is None:
-        st.session_state.backend = backend_options[default_backend_idx]
+        if gateway_info["available"]:
+            st.session_state.backend = "LLM Gateway"
+        elif ollama_info["available"]:
+            st.session_state.backend = "Local (Ollama)"
+        else:
+            st.session_state.backend = "Cloud (Gemini)"
 
     backend_choice = st.radio(
         "Backend",
@@ -495,9 +592,53 @@ with st.sidebar:
     st.session_state.backend = backend_choice
 
     api_key = ""
-    selected_model = DEFAULT_OLLAMA_MODEL
+    selected_model = None
 
-    if backend_choice == "Local (Ollama)":
+    if backend_choice == "LLM Gateway":
+        if gateway_info["available"]:
+            st.markdown(
+                "<div class='status-pill ok'><span class='dot'></span>"
+                "GATEWAY · ONLINE</div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "Smart routing across Llama 3.2 · Gemini 2.5 Flash · Llama 3.1 "
+                "with rate limits, budget caps, and circuit breakers."
+            )
+        else:
+            st.markdown(
+                "<div class='status-pill off'><span class='dot'></span>"
+                "GATEWAY · OFFLINE</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                """
+**Setup:** In your `llm-gateway-platform` folder run:
+```
+docker-compose up -d
+```
+Then refresh this page.
+"""
+            )
+
+        st.session_state.gateway_url = st.text_input(
+            "Gateway URL",
+            value=st.session_state.gateway_url,
+            help="The companion llm-gateway-platform service. Default is localhost:8000.",
+        )
+        st.session_state.team_id = st.text_input(
+            "Team ID",
+            value=st.session_state.team_id,
+            help="Sent as the X-Team-Id header. Drives rate limits and budget tracking.",
+        )
+        st.caption(
+            f"Dashboards: "
+            f"[Grafana](http://localhost:3000) · "
+            f"[Prometheus](http://localhost:9090) · "
+            f"[Metrics]({st.session_state.gateway_url}/metrics)"
+        )
+
+    elif backend_choice == "Local (Ollama)":
         if ollama_info["available"]:
             st.markdown(
                 "<div class='status-pill ok'><span class='dot'></span>"
@@ -505,7 +646,6 @@ with st.sidebar:
                 unsafe_allow_html=True,
             )
             if ollama_info["models"]:
-                # Prefer the default model if installed, else first
                 default_idx = (
                     ollama_info["models"].index(DEFAULT_OLLAMA_MODEL)
                     if DEFAULT_OLLAMA_MODEL in ollama_info["models"]
@@ -519,16 +659,11 @@ with st.sidebar:
                     f"No models found. In a terminal, run:\n\n"
                     f"`ollama pull {DEFAULT_OLLAMA_MODEL}`"
                 )
-                selected_model = None
         else:
             st.markdown(
                 "<div class='status-pill off'><span class='dot'></span>"
                 "OLLAMA · OFFLINE</div>",
                 unsafe_allow_html=True,
-            )
-            st.caption(
-                "Free, no API key needed. Install once and the chat runs entirely "
-                "on this machine."
             )
             st.markdown(
                 """
@@ -536,10 +671,10 @@ with st.sidebar:
 1. Download from [ollama.com/download](https://ollama.com/download)
 2. In a terminal, run: `ollama pull llama3.1:8b`
 3. Refresh this page.
-""",
+"""
             )
-            selected_model = None
-    else:
+
+    else:  # Cloud (Gemini)
         st.markdown(
             "<div class='status-pill warn'><span class='dot'></span>"
             "GEMINI · CLOUD</div>",
@@ -585,7 +720,12 @@ try:
 except Exception:
     inv_rows, inv_tables = 0, 0
 
-if st.session_state.backend == "Local (Ollama)" and ollama_info["available"]:
+if st.session_state.backend == "LLM Gateway" and gateway_info["available"]:
+    backend_pill = (
+        "<div class='status-pill ok'><span class='dot'></span>"
+        f"GATEWAY · {st.session_state.team_id}</div>"
+    )
+elif st.session_state.backend == "Local (Ollama)" and ollama_info["available"]:
     backend_pill = "<div class='status-pill ok'><span class='dot'></span>OLLAMA</div>"
 elif st.session_state.backend == "Cloud (Gemini)" and api_key:
     backend_pill = "<div class='status-pill warn'><span class='dot'></span>GEMINI</div>"
@@ -615,12 +755,37 @@ tab_chat, tab_inventory, tab_kb = st.tabs(["Chat", "Inventory", "Knowledge base"
 # ==============================================================================
 # TAB: CHAT
 # ==============================================================================
+def _render_route_footer(meta: dict):
+    """Render a small mono-font telemetry strip under a gateway answer."""
+    if not meta:
+        return
+    model = meta.get("model_used", "?")
+    latency_ms = meta.get("latency_ms", 0)
+    total_tokens = meta.get("total_tokens", 0)
+    cost = meta.get("cost_usd", 0)
+    st.markdown(
+        f"""
+<div class="route-footer">
+  <span><span class="key">ROUTED</span> · <span class="val">{model}</span></span>
+  <span><span class="key">LATENCY</span> · <span class="val">{latency_ms/1000:.2f}s</span></span>
+  <span><span class="key">TOKENS</span> · <span class="val">{total_tokens}</span></span>
+  <span><span class="key">COST</span> · <span class="val">${cost:.6f}</span></span>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 with tab_chat:
     backend_ready = (
-        st.session_state.backend == "Local (Ollama)"
-        and ollama_info["available"]
-        and selected_model
-    ) or (st.session_state.backend == "Cloud (Gemini)" and api_key)
+        (st.session_state.backend == "LLM Gateway" and gateway_info["available"])
+        or (
+            st.session_state.backend == "Local (Ollama)"
+            and ollama_info["available"]
+            and selected_model
+        )
+        or (st.session_state.backend == "Cloud (Gemini)" and api_key)
+    )
 
     if not st.session_state.chat_history:
         st.markdown(
@@ -646,10 +811,12 @@ with tab_chat:
                 st.session_state.pending_prompt = s
                 st.rerun()
 
-    # Render history
+    # Render history (with routing footer if the message was answered by the gateway)
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if message["role"] == "assistant" and message.get("meta"):
+                _render_route_footer(message["meta"])
 
     prompt = st.session_state.pending_prompt
     st.session_state.pending_prompt = None
@@ -664,7 +831,13 @@ with tab_chat:
 
         if not backend_ready:
             with st.chat_message("assistant"):
-                if st.session_state.backend == "Local (Ollama)":
+                if st.session_state.backend == "LLM Gateway":
+                    st.warning(
+                        f"Gateway isn't reachable at `{st.session_state.gateway_url}`. "
+                        "In the `llm-gateway-platform` folder, run `docker-compose up -d` "
+                        "and refresh this page."
+                    )
+                elif st.session_state.backend == "Local (Ollama)":
                     st.warning(
                         "Ollama isn't reachable. Install it from "
                         "[ollama.com/download](https://ollama.com/download), then run "
@@ -752,26 +925,66 @@ RULES:
 
             try:
                 with st.chat_message("assistant"):
-                    placeholder = st.empty()
-                    full_response = ""
+                    if st.session_state.backend == "LLM Gateway":
+                        # Gateway is non-streaming. Show a spinner during the call,
+                        # then render the answer + routing telemetry footer.
+                        with st.spinner("Routing through gateway…"):
+                            try:
+                                payload = gateway_call(
+                                    full_prompt,
+                                    st.session_state.gateway_url,
+                                    st.session_state.team_id,
+                                )
+                            except GatewayError as ge:
+                                st.error(str(ge))
+                                st.session_state.chat_history.append(
+                                    {"role": "assistant", "content": f"⚠️ {ge}"}
+                                )
+                                st.stop()
 
-                    if st.session_state.backend == "Local (Ollama)":
-                        stream_iter = ollama_stream(full_prompt, selected_model)
+                        full_response = payload.get("output_text", "") or (
+                            "_(Gateway returned no text.)_"
+                        )
+                        meta = {
+                            "model_used": payload.get("model_used", "?"),
+                            "latency_ms": payload.get("latency_ms", 0),
+                            "prompt_tokens": payload.get("prompt_tokens", 0),
+                            "completion_tokens": payload.get("completion_tokens", 0),
+                            "total_tokens": payload.get("total_tokens", 0),
+                            "cost_usd": payload.get("cost_usd", 0),
+                        }
+                        st.markdown(full_response)
+                        _render_route_footer(meta)
+                        st.session_state.chat_history.append(
+                            {
+                                "role": "assistant",
+                                "content": full_response,
+                                "meta": meta,
+                            }
+                        )
                     else:
-                        stream_iter = gemini_stream(full_prompt, selected_model)
+                        # Streaming path for Ollama / Gemini
+                        placeholder = st.empty()
+                        full_response = ""
+                        if st.session_state.backend == "Local (Ollama)":
+                            stream_iter = ollama_stream(full_prompt, selected_model)
+                        else:
+                            stream_iter = gemini_stream(full_prompt, selected_model)
 
-                    for piece in stream_iter:
-                        if piece:
-                            full_response += piece
-                            placeholder.markdown(full_response + "▌")
+                        for piece in stream_iter:
+                            if piece:
+                                full_response += piece
+                                placeholder.markdown(full_response + "▌")
 
-                    if not full_response:
-                        full_response = "_(Model returned no text — possibly a safety filter or empty response.)_"
-                    placeholder.markdown(full_response)
-
-                st.session_state.chat_history.append(
-                    {"role": "assistant", "content": full_response}
-                )
+                        if not full_response:
+                            full_response = (
+                                "_(Model returned no text — possibly a safety filter "
+                                "or empty response.)_"
+                            )
+                        placeholder.markdown(full_response)
+                        st.session_state.chat_history.append(
+                            {"role": "assistant", "content": full_response}
+                        )
             except Exception as e:
                 import traceback
 
