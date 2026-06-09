@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import sqlite3
 import pandas as pd
 import streamlit as st
@@ -433,14 +434,40 @@ def ollama_status():
 
 
 def ollama_stream(prompt: str, model: str):
-    """Yields text deltas from Ollama's /api/generate stream."""
+    """Yields text deltas from Ollama's /api/generate stream.
+
+    Sends `num_ctx=32768` so the full SOP + table-dump context fits.
+    Ollama defaults to a 2048-token window which is far too small once
+    door_access_qc + wifi_qc + other tables are dumped into the prompt.
+    llama3.1:8b supports up to 128K — 32K is a safe middle ground that
+    won't OOM most desktops.
+    """
     with requests.post(
         f"{OLLAMA_URL}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": True},
+        json={
+            "model": model,
+            "prompt": prompt,
+            "stream": True,
+            "options": {
+                "num_ctx": 32768,
+                "temperature": 0.2,
+            },
+        },
         stream=True,
-        timeout=300,
+        timeout=600,
     ) as r:
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # Surface Ollama's actual error body for diagnosability.
+            try:
+                err_body = r.text or ""
+            except Exception:
+                err_body = "(no body)"
+            raise requests.HTTPError(
+                f"Ollama returned {r.status_code}. "
+                f"Likely causes: prompt exceeds context window, model not loaded, "
+                f"or out of memory. Body: {err_body[:400]}",
+                response=r,
+            )
         for line in r.iter_lines():
             if not line:
                 continue
@@ -526,6 +553,170 @@ def gateway_call(prompt: str, url: str, team_id: str) -> dict:
         )
     r.raise_for_status()
     return r.json()
+
+
+# ==============================================================================
+# DOOR INSPECTION HELPERS (FR-04 / FR-05 / FR-06 / FR-07)
+# Resolves on-disk paths under door_images/{unit_id}/{filename}.
+# Image binaries never enter SQLite — only the filename string is stored.
+# ==============================================================================
+DOOR_IMAGES_DIR = "door_images"
+# Matches G1EE, G2EE, F1EE, F2EE, D1EE, D2EE and future units that follow
+# the {letter}{digit}{letter}{letter} convention. Case-insensitive at call time.
+DOOR_UNIT_RE = re.compile(r"\b([A-Za-z]\d[A-Za-z]{2})\b")
+# Phrases that imply "show all doors" — bulk render mode for FR-06.
+BROAD_DOOR_RE = re.compile(
+    r"\b(all\s+doors?|every\s+door|list\s+doors?|door\s+status(?:es)?|status\s+of\s+(?:all\s+)?doors?)\b",
+    re.IGNORECASE,
+)
+
+
+def door_image_path(unit_id, filename) -> str:
+    """Resolve the on-disk path for a door inspection photo."""
+    if not unit_id or not filename:
+        return ""
+    if pd.isna(unit_id) or pd.isna(filename):
+        return ""
+    uid = str(unit_id).strip()
+    fn = str(filename).strip()
+    if not uid or not fn:
+        return ""
+    return os.path.join(DOOR_IMAGES_DIR, uid, fn)
+
+
+def door_image_exists(unit_id, filename) -> bool:
+    p = door_image_path(unit_id, filename)
+    return bool(p) and os.path.isfile(p)
+
+
+def extract_unit_ids(text: str) -> list:
+    """Pull candidate door unit IDs out of free text, uppercased + deduped."""
+    if not text:
+        return []
+    seen, out = set(), []
+    for match in DOOR_UNIT_RE.findall(text):
+        uid = match.upper()
+        if uid not in seen:
+            seen.add(uid)
+            out.append(uid)
+    return out
+
+
+def fetch_all_door_units_with_photos() -> list:
+    """Return all distinct unit_ids in door_access_qc that have a photo reference."""
+    try:
+        with get_sql_connection() as conn:
+            tables = {
+                t[0]
+                for t in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='door_access_qc';"
+                ).fetchall()
+            }
+            if "door_access_qc" not in tables:
+                return []
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(door_access_qc);").fetchall()}
+            if "unit_id" not in cols or "image_filename" not in cols:
+                return []
+            rows = conn.execute(
+                "SELECT DISTINCT UPPER(TRIM(unit_id)) FROM door_access_qc "
+                "WHERE image_filename IS NOT NULL AND TRIM(image_filename) != ''"
+            ).fetchall()
+            return [r[0] for r in rows if r[0]]
+    except Exception:
+        return []
+
+
+def fetch_door_photos_for_units(unit_ids: list) -> list:
+    """For each unit_id, return its photo records sorted newest-first.
+
+    Falls back to row order (SQLite rowid) when inspection_date is missing
+    or unparseable, so admins who forget the date never lose photo display.
+
+    Returns: [{unit_id, photos: [{filename, date, pic, path, exists}, ...]}, ...]
+    """
+    if not unit_ids:
+        return []
+    results = []
+    try:
+        with get_sql_connection() as conn:
+            tables = {
+                t[0]
+                for t in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='door_access_qc';"
+                ).fetchall()
+            }
+            if "door_access_qc" not in tables:
+                return []
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(door_access_qc);").fetchall()}
+            if "unit_id" not in cols or "image_filename" not in cols:
+                return []
+            has_date = "inspection_date" in cols
+            has_pic = "pic" in cols
+            date_select = "inspection_date" if has_date else "NULL AS inspection_date"
+            pic_select = "pic" if has_pic else "NULL AS pic"
+            order_clause = (
+                "ORDER BY inspection_date DESC, rowid DESC"
+                if has_date
+                else "ORDER BY rowid DESC"
+            )
+            for uid in unit_ids:
+                q = (
+                    f"SELECT image_filename, {date_select}, {pic_select} "
+                    f"FROM door_access_qc "
+                    f"WHERE UPPER(TRIM(unit_id)) = ? "
+                    f"AND image_filename IS NOT NULL AND TRIM(image_filename) != '' "
+                    f"{order_clause}"
+                )
+                rows = conn.execute(q, (uid,)).fetchall()
+                if not rows:
+                    continue
+                photos = []
+                for filename, date_val, pic_val in rows:
+                    p = door_image_path(uid, filename)
+                    photos.append(
+                        {
+                            "filename": str(filename),
+                            "date": str(date_val) if date_val else "—",
+                            "pic": str(pic_val) if pic_val else "—",
+                            "path": p,
+                            "exists": bool(p) and os.path.isfile(p),
+                        }
+                    )
+                results.append({"unit_id": uid, "photos": photos})
+    except Exception:
+        return []
+    return results
+
+
+def render_door_photos(photo_groups: list, bulk: bool = False):
+    """Render inspection photos under a chat answer or inventory expander.
+
+    photo_groups is the output of fetch_door_photos_for_units.
+    bulk=True compacts thumbnail width for broad "show all doors" queries.
+    """
+    if not photo_groups:
+        return
+    primary_width = 320 if bulk else 500
+    secondary_width = 260 if bulk else 380
+    for group in photo_groups:
+        uid = group.get("unit_id", "")
+        photos = group.get("photos") or []
+        if not photos:
+            continue
+        newest = photos[0]
+        caption = f"{uid} · {newest['date']} · Submitted by: {newest['pic']}"
+        if newest["exists"]:
+            st.image(newest["path"], caption=caption, width=primary_width)
+        else:
+            st.caption(f"📷 {caption} — Photo not available — file missing.")
+        if len(photos) > 1:
+            with st.expander(f"Show all photos for {uid} ({len(photos)})"):
+                for p in photos[1:]:
+                    cap = f"{uid} · {p['date']} · Submitted by: {p['pic']}"
+                    if p["exists"]:
+                        st.image(p["path"], caption=cap, width=secondary_width)
+                    else:
+                        st.caption(f"📷 {cap} — file missing")
 
 
 # ==============================================================================
@@ -811,12 +1002,18 @@ with tab_chat:
                 st.session_state.pending_prompt = s
                 st.rerun()
 
-    # Render history (with routing footer if the message was answered by the gateway)
+    # Render history (with routing footer if the message was answered by the gateway,
+    # and door inspection photos if the question referenced any door units).
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message["role"] == "assistant" and message.get("meta"):
                 _render_route_footer(message["meta"])
+            if message["role"] == "assistant" and message.get("door_photos"):
+                render_door_photos(
+                    message["door_photos"],
+                    bulk=message.get("door_photos_bulk", False),
+                )
 
     prompt = st.session_state.pending_prompt
     st.session_state.pending_prompt = None
@@ -917,6 +1114,25 @@ Tables you may see:
 RULES:
 - Procedure questions → quote/paraphrase the SOP and cite the source PDF, e.g. "(per APU Off-Campus mesh pairing SOP.pdf)".
 - Inventory questions → read the table and cite the row's `source_file` (and `sheet_name` if present).
+
+- DOOR INSPECTION QUERIES (any prompt mentioning a unit_id like G1EE, G2EE, F1EE, F2EE, D1EE, D2EE — or asking about door status/condition):
+  You MUST report the FULL inspection record from `door_access_qc`, not a one-line summary.
+  Format the answer as a labeled bullet list of every available field for that unit, in this order:
+    • **Unit ID** · **Location** · **Inspection date** · **Inspection time** · **PIC**
+    • **Lock status**
+    • **Break-glass status**
+    • **Controller status**
+    • **Power adapter status**
+    • **Card reader status**
+    • **Remarks** (quote verbatim if present, otherwise write "—")
+  Skip any field that is null / None / empty in the row.
+  After the bullets, add a short **Issues** call-out listing every component whose value is anything other than "Working" / "Online" / "Normal" / "Intact"
+  (e.g. "Not Working", "Faulty", "Offline", "Triggered", "Damaged", "No Power").
+  If the **Remarks** appear to contradict the dropdown values (e.g. remarks mention a fault on a component
+  the form lists as Working), flag it explicitly under Issues as a **Data inconsistency**.
+  When multiple inspection rows exist for the same unit, default to the most recent inspection_date,
+  and mention in the closing line how many historical inspections exist.
+
 - If neither source contains the answer, say so plainly. Do not guess.
 - Tone: senior network engineer — concise, technical, no filler. Use bullets where it helps.
 """
@@ -985,6 +1201,25 @@ RULES:
                         st.session_state.chat_history.append(
                             {"role": "assistant", "content": full_response}
                         )
+
+                    # FR-06: Door inspection photo display.
+                    # Runs inside the assistant message block so photos render
+                    # directly below the text answer. We also stash the photo
+                    # metadata on the chat_history entry so the next Streamlit
+                    # rerun re-renders the same images via the history loop.
+                    uids = extract_unit_ids(prompt)
+                    is_broad = bool(BROAD_DOOR_RE.search(prompt or ""))
+                    if is_broad and not uids:
+                        uids = fetch_all_door_units_with_photos()
+                    photo_groups = fetch_door_photos_for_units(uids)
+                    if photo_groups:
+                        render_door_photos(photo_groups, bulk=is_broad)
+                        if (
+                            st.session_state.chat_history
+                            and st.session_state.chat_history[-1]["role"] == "assistant"
+                        ):
+                            st.session_state.chat_history[-1]["door_photos"] = photo_groups
+                            st.session_state.chat_history[-1]["door_photos_bulk"] = is_broad
             except Exception as e:
                 import traceback
 
@@ -1061,12 +1296,52 @@ with tab_inventory:
 
         filtering = bool(selected_sources) or bool(search_term.strip())
 
+        # FR-07: Door inspection rows show a 📷 indicator next to rows that
+        # have an image_filename reference. We only inject it into the
+        # read-only display path so the data_editor save-roundtrip never
+        # accidentally writes the indicator column back into SQLite.
+        is_door_table = (
+            st.session_state.selected_table == "door_access_qc"
+            and "image_filename" in df_current.columns
+        )
+
         if filtering:
-            st.info(
+            df_display = df_view.copy()
+
+            # Hide columns that are entirely empty within the filtered subset.
+            # door_access_qc unions the schemas of every uploaded source file, so
+            # a filter scoped to one upload would otherwise show a long tail of
+            # empty columns inherited from unrelated source files.
+            def _col_is_empty(series):
+                s = series.astype(object)
+                s = s.where(pd.notna(s), None)
+                return all(
+                    v is None
+                    or (isinstance(v, str) and v.strip() in ("", "None", "nan", "NaN", "NaT"))
+                    for v in s.tolist()
+                )
+
+            empty_cols = [c for c in df_display.columns if _col_is_empty(df_display[c])]
+            if empty_cols:
+                df_display = df_display.drop(columns=empty_cols)
+
+            if is_door_table and "image_filename" in df_display.columns:
+                df_display.insert(
+                    0,
+                    "📷",
+                    df_display["image_filename"].apply(
+                        lambda v: "📷" if (pd.notna(v) and str(v).strip()) else ""
+                    ),
+                )
+
+            info_line = (
                 f"Showing **{len(df_view)} of {len(df_current)}** rows. "
                 "Editing is locked while filtering — clear filters to edit."
             )
-            st.dataframe(df_view, use_container_width=True, hide_index=True)
+            if empty_cols:
+                info_line += f" Hiding {len(empty_cols)} column(s) that are empty in this view."
+            st.info(info_line)
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
         else:
             edited_df = st.data_editor(
                 df_current,
@@ -1090,6 +1365,81 @@ with tab_inventory:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Save failed: {e}")
+
+        # FR-07: Thumbnail panel for door_access_qc. One expander per unit;
+        # newest inspection date first. Max thumbnail width 400px per spec.
+        if is_door_table and "unit_id" in df_current.columns:
+            st.markdown("<hr/>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='section-label'>Door photos</div>"
+                "<div class='section-title'>Inspection photos</div>"
+                "<div class='section-sub'>"
+                "Expand a unit to view its most recent inspection photo. "
+                "Older photos are nested inside each expander."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            try:
+                with get_sql_connection() as conn:
+                    qc_cols = {
+                        row[1]
+                        for row in conn.execute(
+                            "PRAGMA table_info(door_access_qc);"
+                        ).fetchall()
+                    }
+                    has_date = "inspection_date" in qc_cols
+                    has_pic = "pic" in qc_cols
+                    date_sel = (
+                        "inspection_date" if has_date else "NULL AS inspection_date"
+                    )
+                    pic_sel = "pic" if has_pic else "NULL AS pic"
+                    order = (
+                        "ORDER BY inspection_date DESC, rowid DESC"
+                        if has_date
+                        else "ORDER BY rowid DESC"
+                    )
+                    photo_rows = pd.read_sql_query(
+                        f"SELECT unit_id, image_filename, {date_sel}, {pic_sel} "
+                        f"FROM door_access_qc "
+                        f"WHERE image_filename IS NOT NULL "
+                        f"AND TRIM(image_filename) != '' "
+                        f"{order}",
+                        conn,
+                    )
+            except Exception as e:
+                photo_rows = pd.DataFrame()
+                st.caption(f"Could not load photo metadata: {e}")
+
+            if photo_rows.empty:
+                st.caption(
+                    "No inspection photos referenced yet. Upload a `door_*.xlsx` "
+                    "file with an `image_filename` column to populate this section."
+                )
+            else:
+                photo_rows["_unit_key"] = (
+                    photo_rows["unit_id"].astype(str).str.upper().str.strip()
+                )
+                for uid, group in photo_rows.groupby("_unit_key", sort=True):
+                    newest = group.iloc[0]
+                    label = f"📷  {uid}  —  {newest['inspection_date'] or '—'}"
+                    if has_pic and pd.notna(newest["pic"]):
+                        label += f"  ·  {newest['pic']}"
+                    label += f"  ·  {len(group)} photo(s)"
+                    with st.expander(label):
+                        for _, row in group.iterrows():
+                            path = door_image_path(uid, row["image_filename"])
+                            cap = (
+                                f"{uid} · "
+                                f"{row['inspection_date'] or '—'} · "
+                                f"Submitted by: {row['pic'] if has_pic else '—'}"
+                            )
+                            if path and os.path.isfile(path):
+                                st.image(path, caption=cap, width=400)
+                            else:
+                                st.caption(
+                                    f"📷 {row['image_filename']} — "
+                                    "Photo not available — file missing."
+                                )
 
 # ==============================================================================
 # TAB: KNOWLEDGE BASE
@@ -1305,9 +1655,52 @@ with tab_kb:
                             )
                         conn.commit()
 
-                    st.toast(
-                        f"Merged {len(df_upload)} rows into `{target_table}` from {file.name}"
-                    )
+                    # FR-05: door inspection image-reference validation
+                    if (
+                        target_table == "door_access_qc"
+                        and "image_filename" in df_upload.columns
+                        and "unit_id" in df_upload.columns
+                    ):
+                        rows_with_ref = 0
+                        rows_image_ok = 0
+                        missing = []
+                        for _, row in df_upload.iterrows():
+                            fn = row.get("image_filename")
+                            uid = row.get("unit_id")
+                            if (
+                                pd.notna(fn)
+                                and str(fn).strip()
+                                and pd.notna(uid)
+                                and str(uid).strip()
+                            ):
+                                rows_with_ref += 1
+                                if door_image_exists(uid, fn):
+                                    rows_image_ok += 1
+                                else:
+                                    missing.append(
+                                        f"{str(uid).strip()}/{str(fn).strip()}"
+                                    )
+                        st.success(
+                            f"Ingested **{len(df_upload)}** rows into "
+                            f"`{target_table}` from **{file.name}** · "
+                            f"{rows_with_ref} with image refs · "
+                            f"{rows_image_ok} found on disk · "
+                            f"{len(missing)} missing."
+                        )
+                        if missing:
+                            with st.expander(
+                                f"⚠️ {len(missing)} referenced image(s) not found "
+                                f"under `door_images/`"
+                            ):
+                                for m in missing[:50]:
+                                    st.code(f"door_images/{m}", language="text")
+                                if len(missing) > 50:
+                                    st.caption(f"…and {len(missing) - 50} more")
+                    else:
+                        st.toast(
+                            f"Merged {len(df_upload)} rows into "
+                            f"`{target_table}` from {file.name}"
+                        )
                     st.session_state.processed_excel_sigs.add(file_id)
                     new_excel_ingested = True
                 except Exception as e:

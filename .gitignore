@@ -32,3 +32,10 @@ Thumbs.db
 # --- Scratch / temp files ---
 _*.py
 *.tmp
+
+# --- Door inspection photos ---
+# Keep the folder structure (and .gitkeep) tracked, but never commit actual photo files.
+door_images/**
+!door_images/
+!door_images/**/
+!door_images/**/.gitkeep
