@@ -933,7 +933,7 @@ st.markdown(
   </div>
   <div class="status-strip">
     <div class="status-pill ok"><span class="dot"></span>KB · {kb_count} chunks</div>
-    <div class="status-pill ok"><span class="dot"></span>INV · {inv_rows} rows / {inv_tables} tables</div>
+    <div class="status-pill ok"><span class="dot"></span>QC · {inv_rows} rows / {inv_tables} tables</div>
     {backend_pill}
   </div>
 </div>
@@ -941,7 +941,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_chat, tab_inventory, tab_kb = st.tabs(["Chat", "Inventory", "Knowledge base"])
+tab_chat, tab_inventory, tab_kb = st.tabs(["Chat", "QC Records", "Knowledge base"])
 
 # ==============================================================================
 # TAB: CHAT
@@ -1231,9 +1231,9 @@ RULES:
 # ==============================================================================
 with tab_inventory:
     st.markdown(
-        "<div class='section-label'>Asset matrix</div>"
-        "<div class='section-title'>Network inventory</div>"
-        "<div class='section-sub'>Browse, search, and edit data ingested from your spreadsheets.</div>",
+        "<div class='section-label'>Inspection ledger</div>"
+        "<div class='section-title'>QC records</div>"
+        "<div class='section-sub'>Browse, search, and edit data ingested from your QC and inventory spreadsheets.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1448,7 +1448,7 @@ with tab_kb:
     st.markdown(
         "<div class='section-label'>Ingestion</div>"
         "<div class='section-title'>Knowledge base</div>"
-        "<div class='section-sub'>Upload SOPs and inventory spreadsheets. Everything stays on this machine.</div>",
+        "<div class='section-sub'>Upload SOPs and QC spreadsheets. Everything stays on this machine.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1519,7 +1519,7 @@ with tab_kb:
         st.markdown(
             "<div style='font-family:JetBrains Mono,monospace;font-size:0.78rem;"
             "color:#10F0A0;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:0.3rem;'>"
-            "Inventory spreadsheets</div>"
+            "QC spreadsheets</div>"
             "<div class='kb-meta'>CSV, XLSX · multi-sheet workbooks fully ingested</div>",
             unsafe_allow_html=True,
         )
@@ -1760,7 +1760,7 @@ with tab_kb:
         st.markdown(
             "<div style='font-family:JetBrains Mono,monospace;font-size:0.78rem;"
             "color:#10F0A0;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:0.6rem;'>"
-            "Inventory spreadsheets</div>",
+            "QC spreadsheets</div>",
             unsafe_allow_html=True,
         )
         try:
