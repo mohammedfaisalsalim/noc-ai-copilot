@@ -355,6 +355,41 @@ label, .stRadio label, .stCheckbox label {
     font-size: 0.95rem;
 }
 
+/* ===== Thinking indicator (shown under bot avatar during Ollama/Gemini calls) ===== */
+.thinking-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.85rem 1.1rem;
+    background: rgba(19,25,34,0.7);
+    border: 1px solid #1F2A38;
+    border-left: 3px solid #00D4FF;
+    border-radius: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    letter-spacing: 0.04em;
+    color: #9AA5B1;
+}
+.thinking-indicator .dots {
+    display: inline-flex;
+    gap: 0.3rem;
+}
+.thinking-indicator .dots span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #00D4FF;
+    box-shadow: 0 0 8px rgba(0,212,255,0.6);
+    animation: thinking-pulse 1.4s ease-in-out infinite;
+}
+.thinking-indicator .dots span:nth-child(2) { animation-delay: 0.18s; }
+.thinking-indicator .dots span:nth-child(3) { animation-delay: 0.36s; }
+@keyframes thinking-pulse {
+    0%, 60%, 100% { opacity: 0.25; transform: scale(0.7); }
+    30%           { opacity: 1;    transform: scale(1.1); }
+}
+.thinking-indicator .label .accent { color: #00D4FF; }
+
 /* ===== Routing telemetry footer (shown under gateway answers) ===== */
 .route-footer {
     margin-top: 0.6rem;
@@ -686,6 +721,147 @@ def fetch_door_photos_for_units(unit_ids: list) -> list:
     except Exception:
         return []
     return results
+
+
+# Keyword maps used to decide which SQLite tables to inject into the LLM prompt.
+# Keep these tight — overly broad terms (e.g. "channel") cause false positives that
+# pull in tables the user didn't ask about.
+TABLE_KEYWORDS = {
+    "door_access_qc": {
+        "door", "doors", "lock", "breakglass", "break-glass", "break glass",
+        "controller", "card reader", "card_reader", "power adapter",
+        "power_adapter", "access control", "qc form", "inspection",
+    },
+    "wifi_qc": {
+        "wifi", "wi-fi", "wireless", "ssid", "bssid", "access point",
+        "access points", "rssi", "signal strength", "2.4ghz", "5ghz",
+        " ap ", " aps ", "ap-",
+    },
+    "cctv_qc": {
+        "cctv", "camera", "cameras", "nvr", "hikvision", "ip surveillance",
+        "video stream", "surveillance", "channel ",
+    },
+    "general_inventory": {
+        "inventory", "asset", "assets", "materials", "stock", "spare",
+        "serial number", "serial_number", "model number",
+    },
+}
+
+# Phrases that imply a pure procedure / SOP query with no need for table data.
+PROCEDURE_RE = re.compile(
+    r"\b(how\s+do\s+i|how\s+to|what(?:'|’)?s\s+the\s+procedure|"
+    r"walk\s+me\s+through|steps?\s+to|explain\s+how|explain\s+the|"
+    r"configure|set\s*up|troubleshoot|reset|reboot|recover|"
+    r"per\s+the\s+sop|sop\s+for)\b",
+    re.IGNORECASE,
+)
+
+
+def select_tables_for_prompt(prompt: str, all_tables: list) -> list:
+    """Pick the subset of SQLite tables worth injecting into the LLM context.
+
+    Heuristics, in priority order:
+      1. Door unit ID detected (G1EE, F2EE, ...) → door_access_qc only.
+      2. Per-table keyword matches → only matching tables.
+      3. No table keywords AND procedure-style phrasing → no tables (SOP-only).
+      4. Fallback → all tables (safe default for ambiguous data queries).
+
+    This cuts prompt size 5-10x for typical single-domain queries, which is
+    the biggest latency lever on the Ollama / Gemini paths.
+    """
+    if not prompt or not all_tables:
+        return all_tables
+    p_lower = prompt.lower()
+
+    # Rule 1: a specific door unit always implies the door table.
+    if extract_unit_ids(prompt) and "door_access_qc" in all_tables:
+        return ["door_access_qc"]
+
+    # Rule 2: keyword match per table.
+    matched = []
+    for table, kws in TABLE_KEYWORDS.items():
+        if table not in all_tables:
+            continue
+        for kw in kws:
+            if kw in p_lower:
+                matched.append(table)
+                break
+    # Also pick up tables not in TABLE_KEYWORDS but referenced by name.
+    for table in all_tables:
+        if table not in matched and table.lower() in p_lower:
+            matched.append(table)
+
+    if matched:
+        return matched
+
+    # Rule 3: pure procedure question — skip tables, RAG handles SOPs.
+    if PROCEDURE_RE.search(prompt):
+        return []
+
+    # Rule 4: ambiguous → include everything (safe).
+    return all_tables
+
+
+def _build_table_context(conn, table: str, prompt: str, max_rows: int = 1000) -> str:
+    """Compact text snapshot of a SQLite table for the LLM prompt.
+
+    Two compaction tricks that materially shrink prompt size:
+      1. For door_access_qc, if the prompt names specific unit IDs, only that
+         unit's rows are loaded (1 row vs. 218 rows is the typical case).
+      2. Columns that are 100% empty in the result set are dropped. This is
+         the big win for door_access_qc, whose schema is the union of every
+         spreadsheet ever uploaded into it (most columns are null for any
+         given row).
+    """
+    cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table});").fetchall()]
+    if not cols:
+        return f"\nTABLE: {table} (no schema)\n---"
+
+    total_rows = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    # Door-specific narrowing: if the prompt names a unit ID, only load those rows.
+    where_clause, params, scope_note = "", (), ""
+    if table == "door_access_qc" and "unit_id" in cols:
+        uids = extract_unit_ids(prompt)
+        if uids:
+            placeholders = ",".join(["?"] * len(uids))
+            where_clause = (
+                f"WHERE UPPER(TRIM(unit_id)) IN ({placeholders}) "
+                f"ORDER BY rowid DESC"
+            )
+            params = tuple(uids)
+
+    query = f"SELECT * FROM {table} {where_clause} LIMIT {max_rows}"
+    try:
+        df_snap = pd.read_sql_query(query, conn, params=params)
+    except Exception as e:
+        return f"\nTABLE: {table} (read failed: {e})\n---"
+
+    scope_note = (
+        f"filtered to {len(df_snap)} of {total_rows} rows for queried units"
+        if where_clause
+        else f"showing {len(df_snap)} of {total_rows} rows"
+    )
+
+    # Drop columns that are 100% empty within the selected slice.
+    if not df_snap.empty:
+        keep = []
+        for c in df_snap.columns:
+            col = df_snap[c]
+            if col.isna().all():
+                continue
+            if col.astype(str).str.strip().isin(["", "None", "nan", "NaN", "NaT"]).all():
+                continue
+            keep.append(c)
+        if keep:
+            dropped = len(df_snap.columns) - len(keep)
+            df_snap = df_snap[keep]
+            if dropped:
+                scope_note += f", {dropped} empty columns hidden"
+
+    block = f"\nTABLE: {table} ({scope_note})\n"
+    block += df_snap.to_string(index=False) + "\n---"
+    return block
 
 
 def render_door_photos(photo_groups: list, bulk: bool = False):
@@ -1064,7 +1240,10 @@ with tab_chat:
             except Exception as e:
                 rag_context = f"SOP vector query failed: {type(e).__name__}: {e}"
 
-            # Full table dumps (capped)
+            # Prompt-aware table dumps. select_tables_for_prompt() returns only
+            # the tables this question actually needs, which keeps the prompt
+            # small and inference fast. Falls back to all tables if the query
+            # is ambiguous.
             db_context = ""
             MAX_ROWS_PER_TABLE = 1000
             try:
@@ -1075,16 +1254,26 @@ with tab_chat:
                             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';"
                         ).fetchall()
                     ]
-                    if chat_tables:
-                        for table in chat_tables:
-                            total_rows = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                            df_snap = pd.read_sql_query(
-                                f"SELECT * FROM {table} LIMIT {MAX_ROWS_PER_TABLE}", conn
+                    selected_tables = select_tables_for_prompt(prompt, chat_tables)
+                    if selected_tables:
+                        for table in selected_tables:
+                            db_context += _build_table_context(
+                                conn, table, prompt, max_rows=MAX_ROWS_PER_TABLE
                             )
+                        if 0 < len(selected_tables) < len(chat_tables):
+                            skipped = [t for t in chat_tables if t not in selected_tables]
                             db_context += (
-                                f"\nTABLE: {table} (showing {len(df_snap)} of {total_rows} rows)\n"
+                                f"\n(Other tables exist but were skipped as "
+                                f"unrelated to this question: {', '.join(skipped)}. "
+                                f"Ask again with table-specific keywords to load them.)"
                             )
-                            db_context += df_snap.to_string(index=False) + "\n---"
+                    elif chat_tables:
+                        db_context = (
+                            "No relational tables loaded for this query — the "
+                            "question looks procedure-only, so SOPs are the "
+                            "primary source. Tables available but not loaded: "
+                            f"{', '.join(chat_tables)}."
+                        )
                     else:
                         db_context = "No relational tables present."
             except Exception as e:
@@ -1179,8 +1368,24 @@ RULES:
                             }
                         )
                     else:
-                        # Streaming path for Ollama / Gemini
+                        # Streaming path for Ollama / Gemini.
+                        # Show an animated "Thinking…" badge inside the placeholder
+                        # immediately, so the user sees activity while the model
+                        # warms up. The first streamed token replaces it.
                         placeholder = st.empty()
+                        label = (
+                            "Querying llama3.1 locally"
+                            if st.session_state.backend == "Local (Ollama)"
+                            else "Querying Gemini 2.5 Flash"
+                        )
+                        placeholder.markdown(
+                            f"""<div class="thinking-indicator">
+  <div class="dots"><span></span><span></span><span></span></div>
+  <div class="label">Thinking · <span class="accent">{label}</span></div>
+</div>""",
+                            unsafe_allow_html=True,
+                        )
+
                         full_response = ""
                         if st.session_state.backend == "Local (Ollama)":
                             stream_iter = ollama_stream(full_prompt, selected_model)
