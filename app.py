@@ -212,8 +212,14 @@ html, body, [class*="css"] {
     font-size: 0.78rem;
     font-weight: 500;
     letter-spacing: 0.06em;
-    padding: 0.4rem 0.9rem;
-    white-space: nowrap !important;
+    padding: 0.55rem 1rem;
+    /* Allow multi-line text so long suggestion-chip labels (e.g. "A CCTV
+       camera shows no signal. What's the standard troubleshooting flow?")
+       wrap inside the button instead of overflowing the rounded box. */
+    white-space: normal;
+    line-height: 1.35;
+    text-align: center;
+    min-height: 2.4rem;
     transition: all 0.15s ease;
 }
 .stButton > button:hover {
@@ -294,6 +300,51 @@ label, .stRadio label, .stCheckbox label {
 [data-testid="stChatInput"] textarea:focus {
     border-color: #00D4FF !important;
     box-shadow: 0 0 0 1px #00D4FF, 0 0 16px rgba(0,212,255,0.25) !important;
+}
+
+/* ===== Sticky chat input (Claude-style) =====
+   Pinned to the bottom of the viewport. The full-width strip uses a
+   strong gradient that becomes fully opaque before reaching the input,
+   so previous messages never bleed through. The actual input field is
+   centred at a Claude-style narrow width via flexbox (robust to whatever
+   nested div structure Streamlit decides to render). */
+[data-testid="stChatInput"] {
+    position: fixed !important;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    padding: 1rem 2rem 1.5rem 2rem;
+    background: linear-gradient(
+        180deg,
+        rgba(10, 14, 20, 0)    0%,
+        rgba(10, 14, 20, 0.98) 28%,
+        #0A0E14                45%
+    );
+    backdrop-filter: blur(8px);
+
+    /* Flexbox centering — works regardless of how many wrapper divs
+       Streamlit injects between this and the textarea. */
+    display: flex !important;
+    justify-content: center;
+    transition: left 0.25s ease;
+}
+/* Constrain the actual input column to Claude-style width. */
+[data-testid="stChatInput"] > div {
+    width: 100%;
+    max-width: 760px;
+}
+/* Shift the strip right when the sidebar is open so it occupies only
+   the visible main content area, not the full viewport. Uses :has()
+   (modern Chrome / Edge / Firefox / Safari). */
+body:has([data-testid="stSidebar"][aria-expanded="true"]) [data-testid="stChatInput"] {
+    left: 244px;
+}
+/* Reserve enough space below the last message so scrolling clears the
+   sticky input. Apply to the outer block-container so it works no matter
+   which tab is active. */
+.block-container {
+    padding-bottom: 10rem !important;
 }
 
 /* ===== Suggestion chips ===== */
